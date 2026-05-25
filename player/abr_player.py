@@ -1,15 +1,20 @@
 """
-StreamForge ABR Player Simulator
-──────────────────────────────────
-Simulates what a real HLS player (HLS.js, Shaka) does:
-  1. Fetch master manifest → parse variant streams
-  2. Pick best quality based on simulated bandwidth
-  3. Fetch variant manifest → get segment list
-  4. Fetch segments in order (with timing)
-  5. Adapt bitrate based on download speed (ABR)
-  6. Print real-time playback stats
+StreamForge ABR Player Simulator (CLI)
+───────────────────────────────────────
+Simulates what HLS.js / Shaka Player does when playing a VOD asset:
 
-Run this to see ABR in action without a browser.
+  1. Fetch master.m3u8 → parse all variant streams
+  2. Fetch variant manifest → get full segment list (VOD = complete list)
+  3. Pick starting quality based on simulated bandwidth
+  4. Download each segment, measure real download speed
+  5. ABR algorithm decides to upgrade / hold / downgrade quality
+  6. Print live stats table to terminal
+
+Usage:
+  python abr_player.py --asset vod-ABC123DEF456
+  python abr_player.py --url http://localhost:8080/vod/vod-ABC123/master.m3u8
+  python abr_player.py --asset vod-ABC123 --bandwidth 2.5
+  python abr_player.py --list          (list available assets then pick one)
 """
 
 import argparse
@@ -17,24 +22,26 @@ import asyncio
 import json
 import logging
 import re
+import sys
 import time
 import urllib.request
 import urllib.error
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [PLAYER] %(message)s")
+logging.basicConfig(level=logging.WARNING, format="%(asctime)s [PLAYER] %(message)s")
 log = logging.getLogger("player")
 
-BUFFER_TARGET   = 15.0    # seconds of buffer to maintain
-BUFFER_MIN      = 3.0     # below this, downgrade quality
-BUFFER_PANIC    = 1.0     # below this, panic downgrade
-SEGMENT_DURATION = 2.0    # seconds per segment
-POLL_INTERVAL    = 1.0    # manifest poll interval (seconds)
+API_BASE         = "http://localhost:8080"
+BUFFER_TARGET    = 20.0   # seconds — VOD player keeps more buffer
+BUFFER_MIN       = 4.0    # below this → downgrade
+BUFFER_PANIC     = 1.5    # below this → panic to lowest
+POLL_INTERVAL    = 0.5    # VOD: segments are all available, poll faster
+BW_SAFETY        = 0.80   # only use 80% of measured bandwidth for ABR
 
 
 @dataclass
-class VariantStream:
+class Variant:
     bandwidth: int
     resolution: str
     name: str
@@ -49,251 +56,330 @@ class Segment:
 
 
 @dataclass
-class PlayerState:
-    level: int = -1           # -1 = auto ABR
-    buffer_level: float = 0.0
+class PlaybackStats:
+    level: int = -1
+    buffer: float = 0.0
     playhead: float = 0.0
-    segments_loaded: int = 0
-    bytes_downloaded: int = 0
-    dropped_frames: int = 0
-    current_bandwidth_bps: float = 0.0
-    stall_count: int = 0
-    quality_switches: int = 0
+    segments: int = 0
+    bytes_dl: int = 0
+    bandwidth_bps: float = 0.0
+    stalls: int = 0
+    switches: int = 0
+    dropped: int = 0
 
 
-class ManifestParser:
-    @staticmethod
-    def parse_master(content: str, base_url: str) -> List[VariantStream]:
-        streams = []
-        lines = content.strip().split("\n")
-        i = 0
-        while i < len(lines):
-            line = lines[i].strip()
-            if line.startswith("#EXT-X-STREAM-INF"):
-                bw_match  = re.search(r"BANDWIDTH=(\d+)", line)
-                res_match = re.search(r"RESOLUTION=([\dx]+)", line)
-                name_match = re.search(r'NAME="([^"]+)"', line)
-                bw  = int(bw_match.group(1))  if bw_match  else 0
-                res = res_match.group(1)        if res_match else "?"
-                name = name_match.group(1)      if name_match else str(i)
-                uri_line = lines[i+1].strip() if i+1 < len(lines) else ""
-                if not uri_line.startswith("http"):
-                    uri_line = base_url.rsplit("/", 1)[0] + "/" + uri_line
-                streams.append(VariantStream(bandwidth=bw, resolution=res, name=name, uri=uri_line))
-                i += 2
-                continue
-            i += 1
-        return sorted(streams, key=lambda s: s.bandwidth, reverse=True)
+# ── Manifest parsing ───────────────────────────────────────────────────────
+def parse_master(text: str, base_url: str) -> List[Variant]:
+    variants = []
+    lines = text.strip().splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if line.startswith("#EXT-X-STREAM-INF"):
+            bw   = int(re.search(r"BANDWIDTH=(\d+)", line).group(1)) if re.search(r"BANDWIDTH=(\d+)", line) else 0
+            res  = re.search(r"RESOLUTION=([\dx]+)", line)
+            name = re.search(r'NAME="([^"]+)"', line)
+            uri  = lines[i + 1].strip() if i + 1 < len(lines) else ""
+            if not uri.startswith("http"):
+                uri = base_url.rsplit("/", 1)[0] + "/" + uri
+            variants.append(Variant(
+                bandwidth  = bw,
+                resolution = res.group(1)  if res  else "?",
+                name       = name.group(1) if name else str(len(variants)),
+                uri        = uri,
+            ))
+            i += 2
+            continue
+        i += 1
+    return sorted(variants, key=lambda v: v.bandwidth, reverse=True)
 
-    @staticmethod
-    def parse_variant(content: str, base_url: str, media_sequence_start: int = 0) -> tuple:
-        segments = []
-        lines = content.strip().split("\n")
-        media_seq = media_sequence_start
-        seq_counter = 0
 
-        for i, line in enumerate(lines):
-            line = line.strip()
-            if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
-                media_seq = int(line.split(":")[1])
-                seq_counter = media_seq
-            elif line.startswith("#EXTINF:"):
+def parse_variant(text: str, base_url: str) -> List[Segment]:
+    """Parse a variant .m3u8 — for VOD all segments are listed."""
+    segments = []
+    lines = text.strip().splitlines()
+    seq = 0
+    for line in lines:
+        line = line.strip()
+        if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+            seq = int(line.split(":")[1])
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if line.startswith("#EXTINF:"):
+            try:
                 dur = float(line.split(":")[1].rstrip(","))
-                uri = lines[i+1].strip() if i+1 < len(lines) else ""
-                if uri and not uri.startswith("#"):
-                    if not uri.startswith("http"):
-                        uri = base_url.rsplit("/", 1)[0] + "/" + uri
-                    segments.append(Segment(uri=uri, duration=dur, sequence=seq_counter))
-                    seq_counter += 1
-        return segments, media_seq
+            except Exception:
+                dur = 4.0
+            uri = lines[i + 1].strip() if i + 1 < len(lines) else ""
+            if uri and not uri.startswith("#"):
+                if not uri.startswith("http"):
+                    uri = base_url.rsplit("/", 1)[0] + "/" + uri
+                segments.append(Segment(uri=uri, duration=dur, sequence=seq))
+                seq += 1
+            i += 2
+            continue
+        i += 1
+    return segments
 
 
-class ABRController:
+# ── ABR algorithm ──────────────────────────────────────────────────────────
+class ABR:
     """
-    Simple bandwidth-based ABR algorithm.
-    In production, BOLA or DASH-IF algorithms are used.
+    Simple throughput-based ABR with hysteresis and buffer safety.
     """
-    def __init__(self, variants: List[VariantStream]):
-        self.variants = variants  # sorted high → low bandwidth
+    def __init__(self, variants: List[Variant]):
+        self.variants = variants   # sorted high → low bandwidth
 
-    def select_level(self, bw_bps: float, buffer_level: float, current_level: int) -> int:
-        if buffer_level < BUFFER_PANIC:
-            # Panic: jump to lowest quality
+    def select(self, bw_bps: float, buffer: float, current: int) -> int:
+        # Panic: buffer critically low
+        if buffer < BUFFER_PANIC:
             return len(self.variants) - 1
 
-        if buffer_level < BUFFER_MIN:
-            # Buffer too low: step down one level
-            return min(current_level + 1, len(self.variants) - 1)
+        # Buffer low: step down one level
+        if buffer < BUFFER_MIN:
+            return min(current + 1, len(self.variants) - 1)
 
-        # Normal ABR: pick best quality that fits in bandwidth (with 80% safety margin)
-        safe_bw = bw_bps * 0.80
+        # Normal ABR: pick best quality that fits within safe bandwidth
+        safe = bw_bps * BW_SAFETY
         for i, v in enumerate(self.variants):
-            if v.bandwidth <= safe_bw:
-                # Don't upgrade too aggressively (hysteresis: only upgrade if buffer is healthy)
-                if i < current_level and buffer_level < BUFFER_TARGET * 0.8:
-                    return current_level  # hold current level
+            if v.bandwidth <= safe:
+                # Hysteresis: don't upgrade unless buffer is healthy
+                if i < current and buffer < BUFFER_TARGET * 0.7:
+                    return current
                 return i
 
-        return len(self.variants) - 1  # fallback to lowest
+        # Bandwidth too low even for lowest quality — stay at lowest
+        return len(self.variants) - 1
 
 
-def fetch_url(url: str) -> tuple:
-    """Fetch a URL and return (content_bytes, duration_ms, size_bytes)."""
+# ── HTTP fetch helper ──────────────────────────────────────────────────────
+def fetch(url: str, timeout: int = 15) -> tuple:
+    """Returns (bytes, elapsed_ms, size_bytes). Raises on error."""
     t0 = time.time()
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "StreamForge-Player/1.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = resp.read()
-        elapsed_ms = (time.time() - t0) * 1000
-        return data, elapsed_ms, len(data)
-    except urllib.error.URLError as e:
-        raise ConnectionError(f"Failed to fetch {url}: {e}")
+    req = urllib.request.Request(url, headers={"User-Agent": "StreamForge-Player/2.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = r.read()
+    elapsed_ms = (time.time() - t0) * 1000
+    return data, elapsed_ms, len(data)
 
 
+# ── Player ─────────────────────────────────────────────────────────────────
 class HLSPlayer:
-    def __init__(self, master_url: str, simulated_bw_mbps: float = 5.0):
-        self.master_url = master_url
-        self.sim_bw_bps = simulated_bw_mbps * 1_000_000
-        self.state = PlayerState()
-        self.variants: List[VariantStream] = []
-        self.abr: Optional[ABRController] = None
-        self._running = False
-        self._seen_segments = set()
-        self._current_level = 0
+    def __init__(self, master_url: str, sim_bw_mbps: float = 10.0):
+        self.master_url  = master_url
+        self.sim_bw_bps  = sim_bw_mbps * 1_000_000
+        self.stats       = PlaybackStats()
+        self.variants: List[Variant] = []
+        self.abr: Optional[ABR]      = None
+        self._level      = -1        # current quality index
+        self._running    = False
 
-    def _log_stats(self):
-        level = self.variants[self._current_level] if self.variants else None
-        quality = level.name if level else "?"
-        resolution = level.resolution if level else "?"
-        bw_mbps = self.state.current_bandwidth_bps / 1_000_000
+    def _print_header(self):
+        print(f"\n  \033[96mStreamForge ABR Player\033[0m")
+        print(f"  URL: {self.master_url}")
+        print(f"  Simulated bandwidth: {self.sim_bw_bps/1_000_000:.1f} Mbps\n")
+        print(f"  {'Quality':>8}  {'Res':>10}  {'Buffer':>7}  {'DL Speed':>10}  {'Segs':>5}  {'Stalls':>6}  {'Switches':>8}")
+        print("  " + "─" * 70)
+
+    def _print_stats(self):
+        v   = self.variants[self._level] if self._level >= 0 and self._level < len(self.variants) else None
+        q   = v.name       if v else "?"
+        res = v.resolution if v else "?"
+        bw  = self.stats.bandwidth_bps / 1_000_000
         print(
-            f"\r  ▶ {quality:>6} ({resolution:>9}) | "
-            f"buffer={self.state.buffer_level:4.1f}s | "
-            f"DL={bw_mbps:4.1f}Mbps | "
-            f"segs={self.state.segments_loaded:4d} | "
-            f"stalls={self.state.stall_count} | "
-            f"switches={self.state.quality_switches}",
+            f"\r  {q:>8}  {res:>10}  {self.stats.buffer:>6.1f}s  "
+            f"{bw:>8.1f}M  {self.stats.segments:>5}  "
+            f"{self.stats.stalls:>6}  {self.stats.switches:>8}",
             end="", flush=True
         )
 
     async def run(self):
-        log.info(f"Loading stream: {self.master_url}")
-
-        # Step 1: Fetch master manifest
+        # ── 1. Load master manifest ─────────────────────────────────────────
+        print("  Loading master manifest...")
         try:
-            data, ms, _ = fetch_url(self.master_url)
-        except ConnectionError as e:
-            log.error(f"Cannot reach origin server: {e}")
-            log.error("Make sure the origin server is running: python server/origin_server.py")
+            data, _, _ = fetch(self.master_url)
+        except Exception as e:
+            print(f"\033[91m✗ Cannot reach {self.master_url}\n  {e}\033[0m")
+            print("  Is the server running?  python run_all.py")
             return
 
-        master_content = data.decode("utf-8")
-        self.variants = ManifestParser.parse_master(master_content, self.master_url)
-
+        self.variants = parse_master(data.decode("utf-8"), self.master_url)
         if not self.variants:
-            log.error("No variant streams found in master manifest")
+            print("\033[91m✗ No variant streams in master manifest\033[0m")
             return
 
-        log.info(f"Found {len(self.variants)} quality levels:")
-        for i, v in enumerate(self.variants):
-            log.info(f"  [{i}] {v.name:6} {v.bandwidth//1000:5} kbps  {v.resolution}")
-
-        self.abr = ABRController(self.variants)
-        self._current_level = len(self.variants) - 1  # start at lowest quality
+        self.abr    = ABR(self.variants)
+        self._level = len(self.variants) - 1   # start lowest
         self._running = True
 
-        print("\n  Starting playback simulation...\n")
-        print("  Quality | Resolution | Buffer | DL Speed | Segments | Stalls | Switches")
-        print("  " + "─" * 70)
+        print(f"\n  Found {len(self.variants)} quality levels:")
+        for i, v in enumerate(self.variants):
+            print(f"    [{i}] {v.name:6}  {v.resolution:10}  {v.bandwidth//1000:5} kbps")
 
-        last_media_seq = 0
+        self._print_header()
+
+        # ── 2. Main playback loop ───────────────────────────────────────────
+        all_seen: set = set()
 
         while self._running:
-            # Step 2: ABR decision
-            new_level = self.abr.select_level(
-                self.sim_bw_bps,
-                self.state.buffer_level,
-                self._current_level
-            )
-            if new_level != self._current_level:
-                direction = "↑ UP" if new_level < self._current_level else "↓ DOWN"
-                old_q = self.variants[self._current_level].name
+            # ABR decision
+            new_level = self.abr.select(self.sim_bw_bps, self.stats.buffer, self._level)
+            if new_level != self._level:
+                old_q = self.variants[self._level].name
                 new_q = self.variants[new_level].name
-                print(f"\n  🔀 Quality switch {direction}: {old_q} → {new_q}")
-                self._current_level = new_level
-                self.state.quality_switches += 1
+                direction = "↑" if new_level < self._level else "↓"
+                print(f"\n  \033[93m{direction} Quality switch: {old_q} → {new_q}\033[0m")
+                self._level = new_level
+                self.stats.switches += 1
 
-            variant = self.variants[self._current_level]
+            variant = self.variants[self._level]
 
-            # Step 3: Fetch variant manifest
+            # Fetch variant manifest (VOD: full list always available)
             try:
-                manifest_data, _, _ = fetch_url(variant.uri)
-                segments, media_seq = ManifestParser.parse_variant(
-                    manifest_data.decode("utf-8"), variant.uri, last_media_seq
-                )
-            except ConnectionError as e:
+                mdata, _, _ = fetch(variant.uri)
+                segments     = parse_variant(mdata.decode("utf-8"), variant.uri)
+            except Exception as e:
                 log.warning(f"Manifest fetch failed: {e}")
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
 
-            # Step 4: Fetch new segments
-            new_segments = [s for s in segments if s.sequence not in self._seen_segments]
+            # Process new segments only
+            new_segs = [s for s in segments if s.sequence not in all_seen]
 
-            for seg in new_segments:
+            if not new_segs:
+                # VOD complete
+                if any("#EXT-X-ENDLIST" in mdata.decode("utf-8", errors="replace") for _ in [1]):
+                    print(f"\n\n  \033[92m✓ Playback complete\033[0m")
+                    self._print_final()
+                    break
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
+
+            for seg in new_segs:
                 if not self._running:
                     break
 
-                # Simulate download with bandwidth tracking
                 t0 = time.time()
                 try:
-                    seg_data, dl_ms, seg_bytes = fetch_url(seg.uri)
-                except ConnectionError:
-                    self.state.stall_count += 1
-                    self.state.buffer_level = max(0, self.state.buffer_level - seg.duration)
+                    seg_data, dl_ms, seg_bytes = fetch(seg.uri, timeout=20)
+                except Exception as e:
+                    log.warning(f"Segment fetch failed: {e}")
+                    self.stats.stalls += 1
+                    self.stats.buffer = max(0, self.stats.buffer - seg.duration)
                     continue
 
                 elapsed = time.time() - t0
-                self.state.current_bandwidth_bps = (seg_bytes * 8) / max(elapsed, 0.001)
+                self.sim_bw_bps = (seg_bytes * 8) / max(elapsed, 0.001)
+                self.stats.bandwidth_bps = self.sim_bw_bps
 
-                # Simulate: if download took longer than segment duration → stall
+                # Stall detection
                 if elapsed > seg.duration:
-                    stall_time = elapsed - seg.duration
-                    self.state.stall_count += 1
-                    self.state.buffer_level = max(0, self.state.buffer_level - stall_time)
-                    print(f"\n  ⚠ STALL detected! {stall_time:.1f}s rebuffering...")
+                    stall = elapsed - seg.duration
+                    self.stats.stalls += 1
+                    self.stats.buffer  = max(0, self.stats.buffer - stall)
+                    print(f"\n  \033[91m⚠ Stall: {stall:.1f}s rebuffering\033[0m")
                 else:
-                    self.state.buffer_level += seg.duration
+                    self.stats.buffer += seg.duration
 
-                # Buffer drain (playback consumption)
-                self.state.buffer_level -= seg.duration * 0.1   # slight drain per segment
-                self.state.buffer_level = max(0, min(self.state.buffer_level, 60.0))
+                # Simulate playback drain
+                self.stats.buffer   = max(0, min(self.stats.buffer - seg.duration * 0.15, 120.0))
+                self.stats.segments += 1
+                self.stats.bytes_dl += seg_bytes
+                self.stats.playhead += seg.duration
+                all_seen.add(seg.sequence)
 
-                self.state.segments_loaded += 1
-                self.state.bytes_downloaded += seg_bytes
-                self.state.playhead += seg.duration
-                self._seen_segments.add(seg.sequence)
-                last_media_seq = seg.sequence
+                self._print_stats()
+                await asyncio.sleep(seg.duration * 0.08)   # simulate real-time
 
-                self._log_stats()
-
-                # Simulate real-time playback speed
-                await asyncio.sleep(seg.duration * 0.1)
-
-            # Poll for new segments
             await asyncio.sleep(POLL_INTERVAL)
+
+    def _print_final(self):
+        total_mb = self.stats.bytes_dl / 1_000_000
+        print(f"""
+  ─────────────────────────────────────
+  Playback Summary
+  ─────────────────────────────────────
+  Segments downloaded : {self.stats.segments}
+  Total data          : {total_mb:.1f} MB
+  Quality switches    : {self.stats.switches}
+  Stall events        : {self.stats.stalls}
+  Total playhead      : {self.stats.playhead:.0f}s
+  ─────────────────────────────────────
+""")
 
     def stop(self):
         self._running = False
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="StreamForge ABR Player Simulator")
-    parser.add_argument("--url",       default="http://localhost:8080/live/ls-001/master.m3u8")
-    parser.add_argument("--bandwidth", type=float, default=5.0, help="Simulated bandwidth in Mbps")
+# ── List assets helper ─────────────────────────────────────────────────────
+def pick_asset(server: str) -> str:
+    """Fetch asset list and let user pick one interactively."""
+    try:
+        with urllib.request.urlopen(f"{server}/api/assets", timeout=10) as r:
+            data = json.loads(r.read())
+    except Exception as e:
+        print(f"✗ Cannot reach {server}: {e}")
+        sys.exit(1)
+
+    assets = [a for a in data.get("assets", []) if a.get("status") == "ready"]
+    if not assets:
+        print("No ready assets found. Upload one first:\n  python run_all.py")
+        sys.exit(0)
+
+    print(f"\n\033[96mAvailable assets ({len(assets)} ready):\033[0m\n")
+    for i, a in enumerate(assets):
+        print(f"  [{i+1}] {a['asset_id']:24}  {a.get('name','—')[:30]:30}  "
+              f"{a.get('width','?')}×{a.get('height','?')}  "
+              f"{a.get('duration') and str(int(a['duration']))+'s' or '—'}")
+
+    print()
+    while True:
+        try:
+            choice = input("  Pick an asset [1]: ").strip() or "1"
+            idx = int(choice) - 1
+            if 0 <= idx < len(assets):
+                return assets[idx]["asset_id"]
+        except (ValueError, KeyboardInterrupt):
+            sys.exit(0)
+        print(f"  Please enter a number between 1 and {len(assets)}")
+
+
+# ── Entry point ────────────────────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(
+        description="StreamForge ABR Player Simulator",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python abr_player.py --asset vod-ABC123DEF456
+  python abr_player.py --url http://localhost:8080/vod/vod-ABC/master.m3u8
+  python abr_player.py --asset vod-ABC123 --bandwidth 2.0
+  python abr_player.py --list
+        """
+    )
+    parser.add_argument("--asset",     help="Asset ID (e.g. vod-ABC123DEF456)")
+    parser.add_argument("--url",       help="Direct HLS master URL")
+    parser.add_argument("--server",    default=API_BASE)
+    parser.add_argument("--bandwidth", type=float, default=10.0, help="Simulated DL bandwidth in Mbps")
+    parser.add_argument("--list",      action="store_true", help="List ready assets and pick one")
     args = parser.parse_args()
 
-    player = HLSPlayer(args.url, simulated_bw_mbps=args.bandwidth)
+    if args.list or (not args.asset and not args.url):
+        asset_id = pick_asset(args.server)
+        master_url = f"{args.server}/vod/{asset_id}/master.m3u8"
+    elif args.asset:
+        master_url = f"{args.server}/vod/{args.asset}/master.m3u8"
+    else:
+        master_url = args.url
+
+    player = HLSPlayer(master_url, sim_bw_mbps=args.bandwidth)
     try:
         asyncio.run(player.run())
     except KeyboardInterrupt:
-        print("\n\nPlayer stopped")
+        player.stop()
+        print("\n\n  Player stopped.")
+
+
+if __name__ == "__main__":
+    main()
