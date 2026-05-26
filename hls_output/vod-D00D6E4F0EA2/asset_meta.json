@@ -1,0 +1,15 @@
+{
+  "asset_id": "vod-D00D6E4F0EA2",
+  "status": "ready",
+  "duration": 131.08,
+  "width": 854,
+  "height": 480,
+  "variants": [
+    "480p",
+    "360p"
+  ],
+  "encoded_at": 1779805523.0088792,
+  "r2_uploaded": true,
+  "r2_base_url": "https://pub-1a0e5aa6a74b406ab350a58712fd8862.r2.dev/vod/vod-D00D6E4F0EA2",
+  "error_msg": null
+}

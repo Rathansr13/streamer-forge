@@ -1,0 +1,41 @@
+{
+  "vod-8DA96AA50E1B": {
+    "asset_id": "vod-8DA96AA50E1B",
+    "name": "short_story",
+    "original_filename": "short_story.mp4",
+    "file_size": 4606650,
+    "status": "ready",
+    "created_at": 1779803704.6382706,
+    "updated_at": 1779803820.473719,
+    "duration": 176.209367,
+    "width": 426,
+    "height": 240,
+    "error_msg": null,
+    "encode_progress": 100,
+    "variants": [
+      "360p"
+    ],
+    "r2_uploaded": true,
+    "r2_base_url": "https://pub-1a0e5aa6a74b406ab350a58712fd8862.r2.dev/vod/vod-8DA96AA50E1B"
+  },
+  "vod-D00D6E4F0EA2": {
+    "asset_id": "vod-D00D6E4F0EA2",
+    "name": "short_video",
+    "original_filename": "short_video.mp4",
+    "file_size": 9717637,
+    "status": "ready",
+    "created_at": 1779805286.5899622,
+    "updated_at": 1779805523.1239579,
+    "duration": 131.08,
+    "width": 854,
+    "height": 480,
+    "error_msg": null,
+    "encode_progress": 100,
+    "variants": [
+      "480p",
+      "360p"
+    ],
+    "r2_uploaded": true,
+    "r2_base_url": "https://pub-1a0e5aa6a74b406ab350a58712fd8862.r2.dev/vod/vod-D00D6E4F0EA2"
+  }
+}
