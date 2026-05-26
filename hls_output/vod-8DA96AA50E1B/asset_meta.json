@@ -1,0 +1,14 @@
+{
+  "asset_id": "vod-8DA96AA50E1B",
+  "status": "ready",
+  "duration": 176.209367,
+  "width": 426,
+  "height": 240,
+  "variants": [
+    "360p"
+  ],
+  "encoded_at": 1779803820.4569366,
+  "r2_uploaded": true,
+  "r2_base_url": "https://pub-1a0e5aa6a74b406ab350a58712fd8862.r2.dev/vod/vod-8DA96AA50E1B",
+  "error_msg": null
+}

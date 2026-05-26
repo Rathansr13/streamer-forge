@@ -37,7 +37,7 @@ import asyncio
 # Import the VOD transcoder
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
-from transcoder import encode_vod
+from transcoder import encode_vod, r2_delete_prefix, _r2_client
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [ORIGIN] %(message)s")
 log = logging.getLogger("origin")
@@ -67,7 +67,7 @@ class Asset:
     name:              str
     original_filename: str
     file_size:         int
-    status:            str        # queued | encoding | packaging | ready | error
+    status:            str        # queued | encoding | packaging | uploading | ready | error
     created_at:        float
     updated_at:        float
     duration:          Optional[float] = None
@@ -76,17 +76,29 @@ class Asset:
     error_msg:         Optional[str]   = None
     encode_progress:   int = 0
     variants:          List[str] = field(default_factory=list)
+    r2_uploaded:       bool = False
+    r2_base_url:       str  = ""   # R2 public base URL for this asset, or ""
+
+    def _media_base(self, server_base: str) -> str:
+        """
+        Return the base URL to use for HLS/thumb URLs.
+        If R2 was used, point directly at R2 (no proxying through origin).
+        Otherwise fall back to the origin server's /vod/ route.
+        """
+        if self.r2_uploaded and self.r2_base_url:
+            return self.r2_base_url          # e.g. https://pub-xxx.r2.dev/vod/vod-ABC
+        return f"{server_base}/vod/{self.asset_id}"
 
     def to_dict(self, base_url: str = "") -> dict:
         d = asdict(self)
         d["file_size_mb"]   = round(self.file_size / 1024 / 1024, 2)
         d["created_at_fmt"] = time.strftime("%Y-%m-%d %H:%M", time.localtime(self.created_at))
         if base_url and self.status == "ready":
+            mb = self._media_base(base_url)
             d["urls"] = {
-                "hls_master": f"{base_url}/vod/{self.asset_id}/master.m3u8",
-                "thumbnail":  f"{base_url}/vod/{self.asset_id}/thumb.jpg",
-                **{f"hls_{v}": f"{base_url}/vod/{self.asset_id}/{v}/{v}.m3u8"
-                   for v in self.variants},
+                "hls_master": f"{mb}/master.m3u8",
+                "thumbnail":  f"{mb}/thumb.jpg",
+                **{f"hls_{v}": f"{mb}/{v}/{v}.m3u8" for v in self.variants},
             }
         return d
 
@@ -110,6 +122,8 @@ def _load():
         raw = json.loads(ASSETS_FILE.read_text())
         for aid, d in raw.items():
             d.setdefault("variants", [])
+            d.setdefault("r2_uploaded", False)
+            d.setdefault("r2_base_url", "")
             _assets[aid] = Asset(**d)
         log.info(f"Loaded {len(_assets)} assets from disk")
     except Exception as e:
@@ -121,21 +135,23 @@ def _run_encode(asset: Asset, source_path: str):
     """Called in a daemon thread; updates asset in place."""
 
     def on_progress(status: str, pct: int):
-        asset.status           = status if status not in ("ready", "error") else status
-        asset.encode_progress  = pct
-        asset.updated_at       = time.time()
+        asset.status          = status if status not in ("ready", "error") else status
+        asset.encode_progress = pct
+        asset.updated_at      = time.time()
         _save()
 
     result = encode_vod(asset.asset_id, source_path, on_progress=on_progress)
 
-    asset.status           = result["status"]
-    asset.duration         = result.get("duration")
-    asset.width            = result.get("width")
-    asset.height           = result.get("height")
-    asset.variants         = result.get("variants", [])
-    asset.error_msg        = result.get("error_msg")
-    asset.encode_progress  = 100 if result["status"] == "ready" else 0
-    asset.updated_at       = time.time()
+    asset.status          = result["status"]
+    asset.duration        = result.get("duration")
+    asset.width           = result.get("width")
+    asset.height          = result.get("height")
+    asset.variants        = result.get("variants", [])
+    asset.error_msg       = result.get("error_msg")
+    asset.encode_progress = 100 if result["status"] == "ready" else 0
+    asset.r2_uploaded     = result.get("r2_uploaded", False)
+    asset.r2_base_url     = result.get("r2_base_url", "")
+    asset.updated_at      = time.time()
     _save()
 
 
@@ -229,16 +245,37 @@ async def api_delete_asset(request: web.Request) -> web.Response:
     if not asset:
         return web.Response(status=404, text=json.dumps({"error": "Not found"}),
                             content_type="application/json", headers=CORS)
+
+    # Delete local files
     shutil.rmtree(HLS_DIR    / asset_id, ignore_errors=True)
     shutil.rmtree(UPLOAD_DIR / asset_id, ignore_errors=True)
+
+    # Delete from R2 if it was uploaded there
+    if asset.r2_uploaded:
+        def _r2_delete():
+            try:
+                r2 = _r2_client()
+                if r2:
+                    r2_delete_prefix(r2, f"vod/{asset_id}/")
+                    log.info(f"[{asset_id}] Deleted from R2")
+            except Exception as e:
+                log.warning(f"[{asset_id}] R2 delete failed: {e}")
+        threading.Thread(target=_r2_delete, daemon=True).start()
+
     _save()
     return web.Response(text=json.dumps({"deleted": asset_id}),
                         content_type="application/json", headers=CORS)
 
 
 async def api_health(request: web.Request) -> web.Response:
+    r2_ok = _r2_client() is not None
     return web.Response(
-        text=json.dumps({"status": "ok", "assets": len(_assets)}),
+        text=json.dumps({
+            "status": "ok",
+            "assets": len(_assets),
+            "storage": "r2" if r2_ok else "local",
+            "r2_bucket": os.environ.get("R2_BUCKET", "") if r2_ok else None,
+        }),
         content_type="application/json", headers=CORS,
     )
 
@@ -246,11 +283,18 @@ async def api_health(request: web.Request) -> web.Response:
 # ── HLS / VOD file serving ─────────────────────────────────────────────────
 async def serve_vod_master(request: web.Request) -> web.Response:
     asset_id = request.match_info["asset_id"]
-    path     = HLS_DIR / asset_id / "master.m3u8"
+
+    # If asset is in R2, redirect directly — no need to proxy through origin
+    with _lock:
+        asset = _assets.get(asset_id)
+    if asset and asset.r2_uploaded and asset.r2_base_url:
+        r2_url = f"{asset.r2_base_url}/master.m3u8"
+        return web.Response(status=302, headers={**CORS, "Location": r2_url})
+
+    # Local fallback
+    path = HLS_DIR / asset_id / "master.m3u8"
     if not path.exists():
-        with _lock:
-            a = _assets.get(asset_id)
-        if a and a.status in ("queued", "encoding", "packaging"):
+        if asset and asset.status in ("queued", "encoding", "packaging", "uploading"):
             return web.Response(status=503, text="Encoding in progress",
                                 headers={**CORS, "Retry-After": "3"})
         return web.Response(status=404, text="Asset not found", headers=CORS)
@@ -263,15 +307,24 @@ async def serve_vod_file(request: web.Request) -> web.Response:
     asset_id = request.match_info["asset_id"]
     variant  = request.match_info["variant"]
     filename = request.match_info["filename"]
-    path     = HLS_DIR / asset_id / variant / filename
+
+    # Redirect to R2 if available
+    with _lock:
+        asset = _assets.get(asset_id)
+    if asset and asset.r2_uploaded and asset.r2_base_url:
+        r2_url = f"{asset.r2_base_url}/{variant}/{filename}"
+        return web.Response(status=302, headers={**CORS, "Location": r2_url})
+
+    # Local fallback
+    path = HLS_DIR / asset_id / variant / filename
     if not path.exists():
         return web.Response(status=404, text="Not found", headers=CORS)
     if filename.endswith(".m3u8"):
-        ct  = "application/vnd.apple.mpegurl"
-        cc  = "public, max-age=300"
+        ct = "application/vnd.apple.mpegurl"
+        cc = "public, max-age=300"
     elif filename.endswith(".ts"):
-        ct  = "video/mp2t"
-        cc  = "public, max-age=86400, immutable"
+        ct = "video/mp2t"
+        cc = "public, max-age=86400, immutable"
     else:
         return web.Response(status=400, headers=CORS)
     return web.Response(body=path.read_bytes(),
@@ -280,7 +333,14 @@ async def serve_vod_file(request: web.Request) -> web.Response:
 
 async def serve_thumb(request: web.Request) -> web.Response:
     asset_id = request.match_info["asset_id"]
-    path     = HLS_DIR / asset_id / "thumb.jpg"
+
+    with _lock:
+        asset = _assets.get(asset_id)
+    if asset and asset.r2_uploaded and asset.r2_base_url:
+        r2_url = f"{asset.r2_base_url}/thumb.jpg"
+        return web.Response(status=302, headers={**CORS, "Location": r2_url})
+
+    path = HLS_DIR / asset_id / "thumb.jpg"
     if not path.exists():
         return web.Response(status=404, headers=CORS)
     return web.Response(body=path.read_bytes(),
@@ -511,6 +571,7 @@ body{{background:var(--bg);color:var(--text);font-family:var(--head);-webkit-fon
   </div>
   <div style="display:flex;gap:10px;align-items:center;">
     <div class="hdr-pill"><div class="hdr-dot" id="api-dot" style="background:var(--green)"></div><span id="api-status">READY</span></div>
+    <div class="hdr-pill" id="storage-pill" style="color:var(--muted2)">⬡ LOCAL</div>
     <div class="hdr-pill" style="color:var(--muted2)"><span id="asset-count">0</span> ASSETS</div>
   </div>
 </header>
@@ -544,7 +605,8 @@ body{{background:var(--bg);color:var(--text);font-family:var(--head);-webkit-fon
           <div class="ps" id="ps1"><div class="ps-dot">2</div><div class="ps-lbl">Probe</div></div>
           <div class="ps" id="ps2"><div class="ps-dot">3</div><div class="ps-lbl">Encode</div></div>
           <div class="ps" id="ps3"><div class="ps-dot">4</div><div class="ps-lbl">Package</div></div>
-          <div class="ps" id="ps4"><div class="ps-dot">✓</div><div class="ps-lbl">Ready</div></div>
+          <div class="ps" id="ps4"><div class="ps-dot">5</div><div class="ps-lbl">→ R2</div></div>
+          <div class="ps" id="ps5"><div class="ps-dot">✓</div><div class="ps-lbl">Ready</div></div>
         </div>
       </div>
       <button class="upl-btn" id="upl-btn" disabled onclick="startUpload()">▲  Upload & Ingest</button>
@@ -709,8 +771,9 @@ function setProg(pct, stage, label) {{
 }}
 
 function setPipeStep(active) {{
-  for (let i = 0; i < 5; i++) {{
+  for (let i = 0; i < 6; i++) {{
     const el = document.getElementById('ps' + i);
+    if (!el) continue;
     el.className = 'ps' + (i < active ? ' done' : i === active ? ' act' : '');
   }}
 }}
@@ -724,17 +787,33 @@ async function loadAssets() {{
     document.getElementById('asset-count').textContent = assets.length;
     document.getElementById('lib-count').textContent = assets.length + ' total';
     renderList(assets);
+    // Show storage backend in header
+    try {{
+      const hr = await fetch(API + '/health');
+      const hd = await hr.json();
+      const sp = document.getElementById('storage-pill');
+      if (hd.storage === 'r2') {{
+        sp.innerHTML = '☁ R2 · ' + (hd.r2_bucket || '');
+        sp.style.color = 'var(--accent)';
+        sp.style.borderColor = 'var(--accent)';
+      }} else {{
+        sp.innerHTML = '⬡ LOCAL';
+        sp.style.color = 'var(--muted2)';
+      }}
+    }} catch(_) {{}}
     // Sync encode progress for encoding assets
     assets.forEach(a => {{
-      if (a.asset_id === selectedId && (a.status === 'encoding' || a.status === 'packaging')) {{
+      if (a.asset_id === selectedId && (a.status === 'encoding' || a.status === 'packaging' || a.status === 'uploading')) {{
         const pct = a.encode_progress || 0;
-        setProg(pct, a.status + '...', pct + '%');
-        const si = pct < 5 ? 0 : pct < 10 ? 1 : pct < 90 ? 2 : pct < 98 ? 3 : 4;
+        const stageLabel = a.status === 'uploading' ? 'Uploading to R2...' : a.status + '...';
+        setProg(pct, stageLabel, pct + '%');
+        // Map pct to 6 pipeline steps: upload(0) probe(1) encode(2) package(3) r2(4) ready(5)
+        const si = pct < 5 ? 0 : pct < 10 ? 1 : pct < 88 ? 2 : pct < 91 ? 3 : pct < 99 ? 4 : 5;
         setPipeStep(si);
       }}
       if (a.asset_id === selectedId && a.status === 'ready') {{
         document.getElementById('prog-wrap').style.display = 'none';
-        setPipeStep(5);
+        setPipeStep(6);
       }}
     }});
     // Render detail for selected
@@ -754,13 +833,14 @@ function renderList(assets) {{
     return;
   }}
   el.innerHTML = assets.map(a => {{
-    const bc = a.status === 'ready' ? 'b-ready' : a.status === 'encoding' || a.status === 'packaging' ? 'b-enc' : a.status === 'queued' ? 'b-q' : 'b-err';
+    const bc = a.status === 'ready' ? 'b-ready' : (a.status === 'encoding' || a.status === 'packaging' || a.status === 'uploading') ? 'b-enc' : a.status === 'queued' ? 'b-q' : 'b-err';
     const cls = 'ac' + (a.asset_id === selectedId ? ' sel' : '') + (a.asset_id === playingId ? ' play' : '');
     const thumb = a.status === 'ready' ? `<img src="/vod/${{a.asset_id}}/thumb.jpg" onerror="this.style.display='none'">` : '🎬';
+    const r2tag = a.r2_uploaded ? `<span style="font-size:8px;color:var(--accent);font-family:var(--mono);margin-left:4px;">R2</span>` : '';
     return `<div class="${{cls}}" onclick="selectAsset('${{a.asset_id}}')">
       <div class="ac-thumb">${{thumb}}<div class="ac-ov">▶</div></div>
       <div class="ac-info">
-        <div class="ac-name">${{esc(a.name || a.original_filename)}}</div>
+        <div class="ac-name">${{esc(a.name || a.original_filename)}}${{r2tag}}</div>
         <div class="ac-meta">${{a.asset_id.slice(0,16)}}… · ${{fmtSize(a.file_size)}} · ${{fmtAgo(a.created_at)}}</div>
       </div>
       <span class="badge ${{bc}}">${{a.status.toUpperCase()}}</span>
@@ -783,17 +863,21 @@ function renderDetail(a) {{
     <button class="id-copy" onclick="cp('${{a.asset_id}}',this)">COPY ID</button>
   </div>`;
 
-  // Encode progress
+  // Encode progress (6-step pipeline)
   if (a.status !== 'ready' && a.status !== 'error') {{
     const pct = a.encode_progress || 0;
-    const si  = pct < 5 ? 0 : pct < 10 ? 1 : pct < 90 ? 2 : pct < 98 ? 3 : 4;
+    const si  = pct < 5 ? 0 : pct < 10 ? 1 : pct < 88 ? 2 : pct < 91 ? 3 : pct < 99 ? 4 : 5;
+    const stepLabels = ['Upload','Probe','Encode','Package','→ R2','Ready'];
     html += `<div class="enc-prog">
-      <div class="enc-prog-head"><span>${{a.status}}</span><span>${{pct}}%</span></div>
+      <div class="enc-prog-head">
+        <span>${{a.status === 'uploading' ? 'Uploading to R2...' : a.status}}</span>
+        <span>${{pct}}%</span>
+      </div>
       <div class="prog-track"><div class="prog-fill" style="width:${{pct}}%"></div></div>
       <div class="pipeline" style="margin-top:12px;">
-        ${{[0,1,2,3,4].map(i => `<div class="ps${{i<si?' done':i===si?' act':''}}">
+        ${{[0,1,2,3,4,5].map(i => `<div class="ps${{i<si?' done':i===si?' act':''}}">
           <div class="ps-dot">${{i<si?'✓':i+1}}</div>
-          <div class="ps-lbl">${{['Upload','Probe','Encode','Package','Ready'][i]}}</div>
+          <div class="ps-lbl">${{stepLabels[i]}}</div>
         </div>`).join('')}}
       </div>
     </div>`;
@@ -817,28 +901,39 @@ function renderDetail(a) {{
   }}
 
   // Info grid
+  const storageTag = a.r2_uploaded
+    ? `<span style="background:#4f8ef720;border:1px solid #4f8ef750;color:#4f8ef7;font-size:9px;padding:1px 6px;border-radius:3px;font-family:var(--mono);margin-left:6px;">R2</span>`
+    : `<span style="background:#ffffff15;border:1px solid #ffffff20;color:var(--muted2);font-size:9px;padding:1px 6px;border-radius:3px;font-family:var(--mono);margin-left:6px;">LOCAL</span>`;
   html += `<div class="info-grid">
     <div><div class="info-lbl">Original File</div><div class="info-val">${{esc(a.original_filename)}}</div></div>
     <div><div class="info-lbl">File Size</div><div class="info-val">${{fmtSize(a.file_size)}}</div></div>
     <div><div class="info-lbl">Duration</div><div class="info-val">${{fmtDur(a.duration)}}</div></div>
     <div><div class="info-lbl">Resolution</div><div class="info-val">${{a.width ? a.width+'×'+a.height : '—'}}</div></div>
     <div><div class="info-lbl">Variants</div><div class="info-val">${{(a.variants||[]).join(', ')||'—'}}</div></div>
-    <div><div class="info-lbl">Created</div><div class="info-val">${{a.created_at_fmt||'—'}}</div></div>
+    <div><div class="info-lbl">Storage</div><div class="info-val" style="display:flex;align-items:center;">${{a.r2_uploaded?'Cloudflare R2':'Local disk'}}${{storageTag}}</div></div>
   </div>`;
 
-  // URLs
+  // URLs — use R2 CDN URLs directly if available, else origin proxy
   if (a.status === 'ready') {{
+    const urls = a.urls || {{}};
+    // Build URL list: prefer pre-computed urls from API (which are R2 URLs when uploaded)
     const base = window.location.origin;
-    const hlsUrl = base + '/vod/' + a.asset_id + '/master.m3u8';
+    const hlsUrl   = urls.hls_master || (base + '/vod/' + a.asset_id + '/master.m3u8');
+    const thumbUrl = urls.thumbnail  || (base + '/vod/' + a.asset_id + '/thumb.jpg');
+    const cdnLabel = a.r2_uploaded ? 'R2 CDN' : 'ORIGIN';
     const rows = [
-      ['HLS', 't-hls', hlsUrl],
-      ['THUMB', 't-thumb', base + '/vod/' + a.asset_id + '/thumb.jpg'],
-      ...(a.variants||[]).map(v => [v.toUpperCase(), 't-hls', base + '/vod/' + a.asset_id + '/' + v + '/' + v + '.m3u8']),
+      ['HLS MASTER', 't-hls',   hlsUrl,  cdnLabel],
+      ['THUMBNAIL',  't-thumb', thumbUrl, cdnLabel],
+      ...(a.variants||[]).map(v => {{
+        const u = urls['hls_' + v] || (base + '/vod/' + a.asset_id + '/' + v + '/' + v + '.m3u8');
+        return [v.toUpperCase(), 't-hls', u, cdnLabel];
+      }}),
     ];
-    html += `<div class="urls"><div class="urls-title">Delivery URLs</div>
-      ${{rows.map(([tag,cls,url]) => `<div class="url-row">
+    html += `<div class="urls">
+      <div class="urls-title">Delivery URLs ${{a.r2_uploaded ? '· ☁ Cloudflare R2' : '· ⬡ Local'}}</div>
+      ${{rows.map(([tag,cls,url,cdn]) => `<div class="url-row">
         <span class="url-tag ${{cls}}">${{tag}}</span>
-        <span class="url-val">${{url}}</span>
+        <span class="url-val" title="${{url}}">${{url}}</span>
         <button class="copy-btn" onclick="cp('${{url}}',this)">COPY</button>
       </div>`).join('')}}
     </div>`;
