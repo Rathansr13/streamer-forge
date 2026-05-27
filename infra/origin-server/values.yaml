@@ -1,0 +1,16 @@
+replicaCount: 1
+image:
+  repository: your-registry/origin-server
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+env: {}
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

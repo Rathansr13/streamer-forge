@@ -1,0 +1,14 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir aiohttp flask-cors python-dotenv imageio-ffmpeg boto3
+
+COPY . /app
+
+EXPOSE 8080
+CMD ["python", "run_all.py", "--host", "0.0.0.0", "--port", "8080"]
