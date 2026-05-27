@@ -1,0 +1,19 @@
+replicaCount: 1
+image:
+  repository: your-registry/abr-player
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  enabled: false
+
+env: {}
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+command:
+  - python
+  - player/abr_player.py
+args:
+  - --help

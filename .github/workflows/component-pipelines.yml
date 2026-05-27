@@ -1,0 +1,82 @@
+name: Component CI/CD Pipelines
+
+on:
+  push:
+    branches: ["master"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  test-and-publish:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        component:
+          - name: origin-server
+            dockerfile: Build/Dockerfile.origin-server
+            test_cmd: python -m py_compile server/origin_server.py server/transcoder.py
+          - name: ingest-server
+            dockerfile: Build/Dockerfile.ingest-server
+            test_cmd: python -m py_compile server/ingest_server.py
+          - name: transcoder
+            dockerfile: Build/Dockerfile.transcoder
+            test_cmd: python -m py_compile server/transcoder.py
+          - name: broadcaster
+            dockerfile: Build/Dockerfile.broadcaster
+            test_cmd: python -m py_compile broadcaster/broadcaster.py
+          - name: abr-player
+            dockerfile: Build/Dockerfile.abr-player
+            test_cmd: python -m py_compile player/abr_player.py
+          - name: orchestrator
+            dockerfile: Build/Dockerfile.orchestrator
+            test_cmd: python -m py_compile run_all.py
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies for tests
+        run: |
+          python -m pip install --upgrade pip
+          pip install aiohttp flask-cors python-dotenv imageio-ffmpeg boto3
+
+      - name: Run component tests
+        run: ${{ matrix.component.test_cmd }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/streamer-forge-${{ matrix.component.name }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=master
+            type=sha,prefix=sha-
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.component.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
