@@ -24,8 +24,10 @@ R2 env vars required:
 Local fallback: if R2 env vars are missing the files stay in
 hls_output/ and origin_server serves them directly (same as before).
 """
+
 from dotenv import load_dotenv
 load_dotenv()
+
 import json
 import logging
 import os
