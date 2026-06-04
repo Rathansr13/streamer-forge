@@ -25,6 +25,13 @@ import threading
 import time
 from pathlib import Path
 
+# Load .env before anything else
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent / "server" / ".env")
+except ImportError:
+    pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(message)s",
@@ -49,19 +56,20 @@ def print_banner():
 
 
 def check_deps():
-    """Check Python packages and FFmpeg before starting."""
+    """Check Python packages, FFmpeg, and MongoDB before starting."""
+    # ── Python packages ────────────────────────────────────────────────────
     missing = []
-    for pkg in ["aiohttp", "flask_cors"]:
+    for pkg in ["aiohttp", "pymongo", "dotenv"]:
         try:
-            __import__(pkg)
+            __import__(pkg if pkg != "dotenv" else "dotenv")
         except ImportError:
-            missing.append(pkg)
+            missing.append(pkg if pkg != "dotenv" else "python-dotenv")
     if missing:
         print(f"\033[91mMissing packages: {', '.join(missing)}\033[0m")
-        print("Run: pip install aiohttp flask-cors")
+        print(f"Run: pip install {' '.join(missing)}")
         sys.exit(1)
 
-    # FFmpeg check
+    # ── FFmpeg ─────────────────────────────────────────────────────────────
     import shutil
     found = (
         os.environ.get("FFMPEG_PATH") or
@@ -77,7 +85,34 @@ def check_deps():
   sudo apt install ffmpeg       (Linux)
 \033[0m""")
         sys.exit(1)
-    log.info(f"  FFmpeg: {found}")
+    log.info(f"  FFmpeg:  {found}")
+
+    # ── MongoDB ────────────────────────────────────────────────────────────
+    mongo_uri = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
+    mongo_db  = os.environ.get("MONGO_DB",  "streamforge")
+    try:
+        from pymongo import MongoClient
+        client = MongoClient(mongo_uri, serverSelectionTimeoutMS=4000)
+        client.admin.command("ping")
+        count = client[mongo_db]["assets"].count_documents({})
+        client.close()
+        log.info(f"  MongoDB: {mongo_uri} / {mongo_db}  ({count} assets)")
+    except Exception as e:
+        print(f"""\033[91m
+═══ MongoDB not reachable ═══
+  URI: {mongo_uri}
+  DB:  {mongo_db}
+  Error: {e}
+
+  Options:
+    Local:  Install MongoDB Community Edition and start mongod
+            https://www.mongodb.com/docs/manual/installation/
+    Cloud:  Use MongoDB Atlas free tier (512 MB free)
+            https://www.mongodb.com/atlas/database
+            Then set MONGO_URI=mongodb+srv://user:pass@cluster.mongodb.net/
+            in server/.env
+\033[0m""")
+        sys.exit(1)
 
 
 def _imageio_ffmpeg():
@@ -151,10 +186,15 @@ Examples:
     # Create output dirs
     for d in ["hls_output", "uploads"]:
         (BASE_DIR / d).mkdir(parents=True, exist_ok=True)
-    log.info(f"  HLS output: {BASE_DIR / 'hls_output'}")
-    log.info(f"  Uploads:    {BASE_DIR / 'uploads'}")
+    log.info(f"  HLS dir: {BASE_DIR / 'hls_output'}")
+    log.info(f"  Uploads: {BASE_DIR / 'uploads'}")
 
-    # Inject port/host via env so origin_server picks them up
+    # Migrate assets.json → MongoDB if it still exists
+    assets_json = BASE_DIR / "assets.json"
+    if assets_json.exists():
+        _migrate_assets_json(assets_json)
+
+    # Start VOD origin server
     env = os.environ.copy()
     env["SF_PORT"] = str(args.port)
     env["SF_HOST"] = args.host
@@ -174,6 +214,9 @@ Examples:
     time.sleep(1.5)
     log.info(f"  ✓ VOD Server PID={server.proc.pid}")
 
+    mongo_uri = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
+    mongo_db  = os.environ.get("MONGO_DB",  "streamforge")
+
     print(f"""
 \033[92m═══ StreamForge VOD RUNNING ═══\033[0m
 
@@ -182,6 +225,8 @@ Examples:
   \033[96m📋 Asset List:\033[0m    GET  http://localhost:{args.port}/api/assets
   \033[96m▶  Player:\033[0m        http://localhost:{args.port}/player/<asset_id>
   \033[96m📡 HLS URL:\033[0m       http://localhost:{args.port}/vod/<asset_id>/master.m3u8
+  \033[96m🍃 MongoDB:\033[0m       {mongo_uri} / {mongo_db}
+  \033[96m❤  Health:\033[0m        http://localhost:{args.port}/health
 
   \033[93mWorkflow:\033[0m
     1. Open http://localhost:{args.port}/
@@ -213,6 +258,38 @@ Examples:
         server.stop()
 
 
+def _migrate_assets_json(json_path: Path):
+    """
+    One-time migration: move assets.json records into MongoDB.
+    Renames the file to assets.json.migrated when done.
+    """
+    import json
+    try:
+        from pymongo import MongoClient
+        mongo_uri = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
+        mongo_db  = os.environ.get("MONGO_DB",  "streamforge")
+        client    = MongoClient(mongo_uri, serverSelectionTimeoutMS=4000)
+        col       = client[mongo_db]["assets"]
+
+        raw = json.loads(json_path.read_text())
+        migrated = 0
+        for aid, d in raw.items():
+            d.setdefault("variants",    [])
+            d.setdefault("r2_uploaded", False)
+            d.setdefault("r2_base_url", "")
+            d["_id"] = aid
+            try:
+                col.insert_one(d)
+                migrated += 1
+            except Exception:
+                pass  # already exists — skip
+
+        client.close()
+        json_path.rename(json_path.with_suffix(".json.migrated"))
+        log.info(f"  ✓ Migrated {migrated} assets from assets.json → MongoDB")
+    except Exception as e:
+        log.warning(f"  ⚠ assets.json migration failed: {e} — continuing anyway")
+
+
 if __name__ == "__main__":
     main()
-

@@ -33,6 +33,11 @@ from typing import Dict, List, Optional
 
 from aiohttp import web
 import asyncio
+from dotenv import load_dotenv
+load_dotenv()
+
+from pymongo import MongoClient, DESCENDING
+from pymongo.collection import Collection
 
 # Import the VOD transcoder
 import sys
@@ -45,7 +50,6 @@ log = logging.getLogger("origin")
 BASE_DIR     = Path(__file__).parent.parent
 HLS_DIR      = BASE_DIR / "hls_output"
 UPLOAD_DIR   = BASE_DIR / "uploads"
-ASSETS_FILE  = BASE_DIR / "assets.json"
 ORIGIN_HOST  = "0.0.0.0"
 ORIGIN_PORT  = 8080
 
@@ -58,6 +62,28 @@ CORS = {
     "Access-Control-Allow-Headers":  "Content-Type, Range",
     "Access-Control-Expose-Headers": "Content-Length, Content-Range",
 }
+
+
+# ── MongoDB ────────────────────────────────────────────────────────────────
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
+MONGO_DB  = os.environ.get("MONGO_DB",  "streamforge")
+
+_mongo_client: Optional[MongoClient] = None
+_col: Optional[Collection] = None
+
+
+def get_col() -> Collection:
+    """Return the assets MongoDB collection, connecting on first call."""
+    global _mongo_client, _col
+    if _col is None:
+        _mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        db   = _mongo_client[MONGO_DB]
+        _col = db["assets"]
+        # Unique index on asset_id for fast lookup + upserts
+        _col.create_index("asset_id", unique=True)
+        _col.create_index("created_at")
+        log.info(f"MongoDB connected: {MONGO_URI} / {MONGO_DB}.assets")
+    return _col
 
 
 # ── Asset data model ───────────────────────────────────────────────────────
@@ -103,42 +129,62 @@ class Asset:
         return d
 
 
-# ── In-memory registry ─────────────────────────────────────────────────────
-_assets: Dict[str, Asset] = {}
-_lock   = threading.Lock()
+# ── MongoDB CRUD helpers ────────────────────────────────────────────────────
+def db_insert(asset: Asset):
+    """Insert a new asset document."""
+    doc = asdict(asset)
+    doc["_id"] = asset.asset_id          # use asset_id as Mongo _id
+    get_col().insert_one(doc)
 
 
-def _save():
-    with _lock:
-        data = {aid: asdict(a) for aid, a in _assets.items()}
-    with open(ASSETS_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+def db_update(asset: Asset):
+    """Upsert the full asset document."""
+    doc = asdict(asset)
+    get_col().replace_one({"asset_id": asset.asset_id}, doc, upsert=True)
 
 
-def _load():
-    if not ASSETS_FILE.exists():
-        return
-    try:
-        raw = json.loads(ASSETS_FILE.read_text())
-        for aid, d in raw.items():
-            d.setdefault("variants", [])
-            d.setdefault("r2_uploaded", False)
-            d.setdefault("r2_base_url", "")
-            _assets[aid] = Asset(**d)
-        log.info(f"Loaded {len(_assets)} assets from disk")
-    except Exception as e:
-        log.warning(f"Could not load assets.json: {e}")
+def db_get(asset_id: str) -> Optional[Asset]:
+    """Return Asset from MongoDB or None."""
+    doc = get_col().find_one({"asset_id": asset_id}, {"_id": 0})
+    if not doc:
+        return None
+    doc.setdefault("variants",    [])
+    doc.setdefault("r2_uploaded", False)
+    doc.setdefault("r2_base_url", "")
+    return Asset(**doc)
+
+
+def db_delete(asset_id: str):
+    """Remove asset document from MongoDB."""
+    get_col().delete_one({"asset_id": asset_id})
+
+
+def db_list_all(base_url: str = "") -> list:
+    """Return all assets sorted by created_at desc."""
+    docs = list(get_col().find({}, {"_id": 0}).sort("created_at", DESCENDING))
+    assets = []
+    for doc in docs:
+        doc.setdefault("variants",    [])
+        doc.setdefault("r2_uploaded", False)
+        doc.setdefault("r2_base_url", "")
+        a = Asset(**doc)
+        assets.append(a.to_dict(base_url))
+    return assets
+
+
+def db_count() -> int:
+    return get_col().count_documents({})
 
 
 # ── Background encode worker ───────────────────────────────────────────────
 def _run_encode(asset: Asset, source_path: str):
-    """Called in a daemon thread; updates asset in place."""
+    """Called in a daemon thread; updates asset in MongoDB as it progresses."""
 
     def on_progress(status: str, pct: int):
         asset.status          = status if status not in ("ready", "error") else status
         asset.encode_progress = pct
         asset.updated_at      = time.time()
-        _save()
+        db_update(asset)
 
     result = encode_vod(asset.asset_id, source_path, on_progress=on_progress)
 
@@ -152,7 +198,7 @@ def _run_encode(asset: Asset, source_path: str):
     asset.r2_uploaded     = result.get("r2_uploaded", False)
     asset.r2_base_url     = result.get("r2_base_url", "")
     asset.updated_at      = time.time()
-    _save()
+    db_update(asset)
 
 
 # ── CORS preflight ─────────────────────────────────────────────────────────
@@ -174,7 +220,6 @@ async def api_upload(request: web.Request) -> web.Response:
             dest_dir   = UPLOAD_DIR / asset_id
             dest_dir.mkdir(parents=True, exist_ok=True)
             dest_path  = dest_dir / orig_name
-            # Stream to disk
             with open(dest_path, "wb") as f:
                 while True:
                     chunk = await part.read_chunk(65536)
@@ -196,9 +241,7 @@ async def api_upload(request: web.Request) -> web.Response:
         file_size=file_size, status="queued",
         created_at=now, updated_at=now,
     )
-    with _lock:
-        _assets[asset_id] = asset
-    _save()
+    db_insert(asset)
 
     # Start encoding in background thread
     t = threading.Thread(target=_run_encode, args=(asset, str(dest_path)), daemon=True)
@@ -215,11 +258,8 @@ async def api_upload(request: web.Request) -> web.Response:
 
 
 async def api_list_assets(request: web.Request) -> web.Response:
-    base = str(request.url.origin())
-    with _lock:
-        items = [a.to_dict(base) for a in sorted(
-            _assets.values(), key=lambda x: x.created_at, reverse=True
-        )]
+    base  = str(request.url.origin())
+    items = db_list_all(base)
     return web.Response(
         text=json.dumps({"assets": items, "total": len(items)}),
         content_type="application/json", headers=CORS,
@@ -228,8 +268,7 @@ async def api_list_assets(request: web.Request) -> web.Response:
 
 async def api_get_asset(request: web.Request) -> web.Response:
     asset_id = request.match_info["asset_id"]
-    with _lock:
-        asset = _assets.get(asset_id)
+    asset    = db_get(asset_id)
     if not asset:
         return web.Response(status=404, text=json.dumps({"error": "Not found"}),
                             content_type="application/json", headers=CORS)
@@ -240,17 +279,19 @@ async def api_get_asset(request: web.Request) -> web.Response:
 
 async def api_delete_asset(request: web.Request) -> web.Response:
     asset_id = request.match_info["asset_id"]
-    with _lock:
-        asset = _assets.pop(asset_id, None)
+    asset    = db_get(asset_id)
     if not asset:
         return web.Response(status=404, text=json.dumps({"error": "Not found"}),
                             content_type="application/json", headers=CORS)
+
+    # Remove from MongoDB first
+    db_delete(asset_id)
 
     # Delete local files
     shutil.rmtree(HLS_DIR    / asset_id, ignore_errors=True)
     shutil.rmtree(UPLOAD_DIR / asset_id, ignore_errors=True)
 
-    # Delete from R2 if it was uploaded there
+    # Delete from R2 if uploaded there
     if asset.r2_uploaded:
         def _r2_delete():
             try:
@@ -262,19 +303,26 @@ async def api_delete_asset(request: web.Request) -> web.Response:
                 log.warning(f"[{asset_id}] R2 delete failed: {e}")
         threading.Thread(target=_r2_delete, daemon=True).start()
 
-    _save()
     return web.Response(text=json.dumps({"deleted": asset_id}),
                         content_type="application/json", headers=CORS)
 
 
 async def api_health(request: web.Request) -> web.Response:
     r2_ok = _r2_client() is not None
+    # MongoDB ping
+    try:
+        get_col().database.client.admin.command("ping")
+        mongo_ok = True
+    except Exception:
+        mongo_ok = False
     return web.Response(
         text=json.dumps({
-            "status": "ok",
-            "assets": len(_assets),
-            "storage": "r2" if r2_ok else "local",
+            "status":    "ok",
+            "assets":    db_count(),
+            "storage":   "r2" if r2_ok else "local",
             "r2_bucket": os.environ.get("R2_BUCKET", "") if r2_ok else None,
+            "mongodb":   "connected" if mongo_ok else "error",
+            "mongo_db":  MONGO_DB,
         }),
         content_type="application/json", headers=CORS,
     )
@@ -283,10 +331,9 @@ async def api_health(request: web.Request) -> web.Response:
 # ── HLS / VOD file serving ─────────────────────────────────────────────────
 async def serve_vod_master(request: web.Request) -> web.Response:
     asset_id = request.match_info["asset_id"]
+    asset    = db_get(asset_id)
 
-    # If asset is in R2, redirect directly — no need to proxy through origin
-    with _lock:
-        asset = _assets.get(asset_id)
+    # If asset is in R2, redirect directly
     if asset and asset.r2_uploaded and asset.r2_base_url:
         r2_url = f"{asset.r2_base_url}/master.m3u8"
         return web.Response(status=302, headers={**CORS, "Location": r2_url})
@@ -307,10 +354,9 @@ async def serve_vod_file(request: web.Request) -> web.Response:
     asset_id = request.match_info["asset_id"]
     variant  = request.match_info["variant"]
     filename = request.match_info["filename"]
+    asset    = db_get(asset_id)
 
     # Redirect to R2 if available
-    with _lock:
-        asset = _assets.get(asset_id)
     if asset and asset.r2_uploaded and asset.r2_base_url:
         r2_url = f"{asset.r2_base_url}/{variant}/{filename}"
         return web.Response(status=302, headers={**CORS, "Location": r2_url})
@@ -333,9 +379,8 @@ async def serve_vod_file(request: web.Request) -> web.Response:
 
 async def serve_thumb(request: web.Request) -> web.Response:
     asset_id = request.match_info["asset_id"]
+    asset    = db_get(asset_id)
 
-    with _lock:
-        asset = _assets.get(asset_id)
     if asset and asset.r2_uploaded and asset.r2_base_url:
         r2_url = f"{asset.r2_base_url}/thumb.jpg"
         return web.Response(status=302, headers={**CORS, "Location": r2_url})
@@ -572,6 +617,7 @@ body{{background:var(--bg);color:var(--text);font-family:var(--head);-webkit-fon
   <div style="display:flex;gap:10px;align-items:center;">
     <div class="hdr-pill"><div class="hdr-dot" id="api-dot" style="background:var(--green)"></div><span id="api-status">READY</span></div>
     <div class="hdr-pill" id="storage-pill" style="color:var(--muted2)">⬡ LOCAL</div>
+    <div class="hdr-pill" id="mongo-pill" style="color:var(--muted2)">🍃 MONGO</div>
     <div class="hdr-pill" style="color:var(--muted2)"><span id="asset-count">0</span> ASSETS</div>
   </div>
 </header>
@@ -792,6 +838,7 @@ async function loadAssets() {{
       const hr = await fetch(API + '/health');
       const hd = await hr.json();
       const sp = document.getElementById('storage-pill');
+      const mp = document.getElementById('mongo-pill');
       if (hd.storage === 'r2') {{
         sp.innerHTML = '☁ R2 · ' + (hd.r2_bucket || '');
         sp.style.color = 'var(--accent)';
@@ -799,6 +846,14 @@ async function loadAssets() {{
       }} else {{
         sp.innerHTML = '⬡ LOCAL';
         sp.style.color = 'var(--muted2)';
+      }}
+      if (hd.mongodb === 'connected') {{
+        mp.innerHTML = '🍃 ' + (hd.mongo_db || 'mongo');
+        mp.style.color = 'var(--green)';
+        mp.style.borderColor = 'var(--green)';
+      }} else {{
+        mp.innerHTML = '🍃 MONGO ERROR';
+        mp.style.color = 'var(--red)';
       }}
     }} catch(_) {{}}
     // Sync encode progress for encoding assets
@@ -1161,7 +1216,17 @@ if __name__ == "__main__":
     parser.add_argument("--host", default=os.environ.get("SF_HOST", ORIGIN_HOST))
     cli = parser.parse_args()
 
-    _load()
+    # Connect to MongoDB on startup (validates connection early)
+    try:
+        col = get_col()
+        count = col.count_documents({})
+        log.info(f"MongoDB ready — {count} existing assets in '{MONGO_DB}.assets'")
+    except Exception as e:
+        log.error(f"MongoDB connection failed: {e}")
+        log.error(f"  URI: {MONGO_URI}")
+        log.error("  Make sure MongoDB is running or set MONGO_URI in .env")
+        raise SystemExit(1)
+
     app = create_app()
     log.info(f"StreamForge VOD Server starting on http://{cli.host}:{cli.port}")
     log.info(f"  UI:      http://localhost:{cli.port}/")
